@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -12,10 +13,12 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math/big"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -37,10 +40,115 @@ func New() (*Proxy, error) {
 	}, nil
 }
 
-type Proxy struct {
-	caCert *tls.Certificate
-	cax509 *x509.Certificate
+type route struct {
+	host                 *string
+	scheme               *string
+	pathString           *string
+	pathRegexp           *regexp.Regexp
+	methods              []string
+	handler              ProxyHandler
+	requestInterceptors  []ProxyRequestInterceptor
+	responseInterceptors []ProxyResponseInterceptor
 }
+
+func (r *route) Host(host string) *route {
+	r.host = &host
+	return r
+}
+func (r *route) Scheme(scheme string) *route {
+	r.scheme = &scheme
+	return r
+}
+func (r *route) PathString(path string) *route {
+	r.pathString = &path
+	return r
+}
+func (r *route) PathRegexp(path string) *route {
+	r.pathRegexp = regexp.MustCompile(path)
+	return r
+}
+func (r *route) Methods(methods ...string) *route {
+	r.methods = append(r.methods, methods...)
+	return r
+}
+func (r *route) Handler(h ProxyHandler) *route {
+	r.handler = h
+	return r
+}
+func (r *route) AddRequestInterceptor(m ProxyRequestInterceptor) *route {
+	r.requestInterceptors = append(r.requestInterceptors, m)
+	return r
+}
+func (r *route) AddResponseInterceptor(m ProxyResponseInterceptor) *route {
+	r.responseInterceptors = append(r.responseInterceptors, m)
+	return r
+}
+func (r *route) isMatching(req *http.Request) bool {
+	if r.host != nil && *r.host != req.URL.Hostname() {
+		return false
+	}
+	if r.methods != nil {
+		found := false
+		for _, m := range r.methods {
+			if m == req.Method {
+				found = true
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	if r.scheme != nil {
+		if *r.scheme != req.URL.Scheme {
+			return false
+		}
+	}
+	if r.pathString != nil {
+		if *r.pathString != req.URL.Path {
+			return false
+		}
+	}
+	if r.pathRegexp != nil {
+		if !r.pathRegexp.MatchString(req.URL.Path) {
+			return false
+		}
+	}
+	return true
+}
+
+type Proxy struct {
+	caCert               *tls.Certificate
+	cax509               *x509.Certificate
+	routes               []*route
+	defaultHandler       ProxyHandler
+	requestInterceptors  []ProxyRequestInterceptor
+	responseInterceptors []ProxyResponseInterceptor
+}
+
+func (p *Proxy) CatchAll(h ProxyHandler) *Proxy {
+	p.defaultHandler = h
+	return p
+}
+
+func (p *Proxy) AddRequestInterceptor(m ProxyRequestInterceptor) *Proxy {
+	p.requestInterceptors = append(p.requestInterceptors, m)
+	return p
+}
+
+func (p *Proxy) AddResponseInterceptor(m ProxyResponseInterceptor) *Proxy {
+	p.responseInterceptors = append(p.responseInterceptors, m)
+	return p
+}
+
+func (p *Proxy) NewRoute() *route {
+	r := &route{}
+	p.routes = append(p.routes, r)
+	return r
+}
+
+type ProxyHandler func(*http.Request) (*http.Response, error)
+type ProxyRequestInterceptor func(*http.Request) (*http.Request, error)
+type ProxyResponseInterceptor func(*http.Response) (*http.Response, error)
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Method: %s", r.Method)
@@ -110,12 +218,7 @@ func (p *Proxy) HandleTLS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		// TODO : Timeout management
-		transport := &http.Transport{
-			// Deacticating HTTP2 when calling upstream
-			TLSClientConfig: &tls.Config{},
-		}
-		resp, err := transport.RoundTrip(clientRequest)
+		resp, err := p.HandleRequest(clientRequest)
 
 		if err != nil {
 			log.Printf("Can't proxy : %s", err.Error())
@@ -130,9 +233,99 @@ func (p *Proxy) HandleTLS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (p *Proxy) HandleRequest(req *http.Request) (*http.Response, error) {
+	//common request interceptors
+	var err error
+	var resp *http.Response
+	for _, i := range p.requestInterceptors {
+		req, err = i(req)
+		if err != nil {
+			return resp, err
+		}
+	}
+
+	// Stop at the first matching route
+	matched := false
+	for _, route := range p.routes {
+		if route.isMatching(req) {
+			matched = true
+			for _, i := range route.requestInterceptors {
+				req, err = i(req)
+				if err != nil {
+					return resp, err
+				}
+			}
+
+			if route.handler != nil {
+				resp, err = route.handler(req)
+			} else {
+				resp, err = ForwardHandler(req)
+			}
+			if err != nil {
+				return resp, err
+			}
+			for _, i := range route.responseInterceptors {
+				resp, err = i(resp)
+				if err != nil {
+					return resp, err
+				}
+			}
+		}
+	}
+	// No Route found
+	if !matched {
+		if p.defaultHandler != nil {
+			resp, err = p.defaultHandler(req)
+		} else {
+			resp, err = DenyHandler(req)
+		}
+	}
+	// common response interceptor
+	for _, i := range p.responseInterceptors {
+		resp, err = i(resp)
+		if err != nil {
+			return resp, err
+		}
+	}
+	return resp, err
+}
+
+func ForwardHandler(req *http.Request) (*http.Response, error) {
+	// TODO : Timeout management
+	transport := &http.Transport{
+		// Deacticating HTTP2 when calling upstream
+		TLSClientConfig: &tls.Config{},
+	}
+	// if there's middleware that's the place
+	resp, err := transport.RoundTrip(req)
+	return resp, err
+}
+
+func DenyHandler(req *http.Request) (*http.Response, error) {
+	return newResponse(req, "text/plain", 401, "Blocked by proxy"), nil
+}
+
+func newResponse(r *http.Request, contentType string, status int, body string) *http.Response {
+	resp := &http.Response{}
+	resp.Request = r
+	resp.TransferEncoding = r.TransferEncoding
+	resp.Header = make(http.Header)
+	resp.Header.Add("Content-Type", contentType)
+	resp.StatusCode = status
+	resp.Status = http.StatusText(status)
+	resp.Proto = r.Proto
+	resp.ProtoMajor = r.ProtoMajor
+	resp.ProtoMinor = r.ProtoMinor
+	buf := bytes.NewBufferString(body)
+	resp.ContentLength = int64(buf.Len())
+	resp.Body = ioutil.NopCloser(buf)
+	return resp
+}
+
 func (p *Proxy) generateHostCert(host string) *tls.Certificate {
+	serial, _ := rand.Int(rand.Reader, big.NewInt(2000000000000))
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
+		SerialNumber: serial,
 		Subject: pkix.Name{
 			Organization: []string{"PVI"},
 		},
